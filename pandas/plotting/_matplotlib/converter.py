@@ -255,13 +255,13 @@ class PeriodConverter(mdates.DateConverter):
             ):
                 return get_datevalue(values, axis.freq)
             elif isinstance(values, PeriodIndex):
-                return values.asfreq(axis.freq).asi8
+                return DatetimeConverter._convert_1d(values.to_timestamp(), units, axis)
             elif isinstance(values, Index):
                 return values.map(lambda x: get_datevalue(x, axis.freq))
             elif lib.infer_dtype(values, skipna=False) == "period":
                 # https://github.com/pandas-dev/pandas/issues/24304
                 # convert ndarray[period] -> PeriodIndex
-                return PeriodIndex(values, freq=axis.freq).asi8
+                return DatetimeConverter._convert_1d(PeriodIndex(values, freq=axis.freq).to_timestamp(), units, axis)
             elif isinstance(values, (list, tuple, np.ndarray, Index)):
                 return [get_datevalue(x, axis.freq) for x in values]
         return values
@@ -269,9 +269,9 @@ class PeriodConverter(mdates.DateConverter):
 
 def get_datevalue(date, freq):
     if isinstance(date, Period):
-        return date.asfreq(freq).ordinal
+        return mdates.date2num(date.asfreq(freq).to_timestamp())
     elif isinstance(date, (str, datetime, pydt.date, pydt.time, np.datetime64)):
-        return Period(date, freq).ordinal
+        return mdates.date2num(Period(date, freq))
     elif (
         is_integer(date)
         or is_float(date)
@@ -958,13 +958,27 @@ class TimeSeries_DateLocator(Locator):
         self.plot_obj = plot_obj
         self.finder = get_finder(freq)
 
+    @classmethod
+    def _mdates_to_ordinal(cls, value, freq):
+        """date2num() -> Period.ordinal"""
+        return Period(mdates.num2date(value), freq=freq).ordinal
+
+    @classmethod
+    def _mdates_limit_to_locator(cls, vmin, vmax, freq, finder):
+        return finder(cls._mdates_to_ordinal(vmin, freq), cls._mdates_to_ordinal(vmax, freq), freq)
+
     def _get_default_locs(self, vmin, vmax):
         """Returns the default locations of ticks."""
-        locator = self.finder(vmin, vmax, self.freq)
+        # convert from num -> date -> period -> ordinal
+        locator = self._mdates_limit_to_locator(vmin, vmax, self.freq, self.finder)
+
+        # NOTE: for reasons not yet investigated, PeriodIndex.to_timestamp() crashes
+        # with an OverflowError if we do not take a copy of locator["val"].
+        vals = mdates.date2num(PeriodIndex.from_ordinals(np.array(locator["val"]), freq=self.freq).to_timestamp())
 
         if self.isminor:
-            return np.compress(locator["min"], locator["val"])
-        return np.compress(locator["maj"], locator["val"])
+            return np.compress(locator["min"], vals)
+        return np.compress(locator["maj"], vals)
 
     def __call__(self):
         """Return the locations of the ticks."""
@@ -974,6 +988,7 @@ class TimeSeries_DateLocator(Locator):
         vmin, vmax = vi
         if vmax < vmin:
             vmin, vmax = vmax, vmin
+
         if self.isdynamic:
             locs = self._get_default_locs(vmin, vmax)
         else:  # pragma: no cover
@@ -1043,7 +1058,7 @@ class TimeSeries_DateFormatter(Formatter):
 
     def _set_default_format(self, vmin, vmax):
         """Returns the default ticks spacing."""
-        info = self.finder(vmin, vmax, self.freq)
+        info = TimeSeries_DateLocator._mdates_limit_to_locator(vmin, vmax, self.freq, self.finder)
 
         if self.isminor:
             format = np.compress(info["min"] & np.logical_not(info["maj"]), info)
@@ -1068,7 +1083,7 @@ class TimeSeries_DateFormatter(Formatter):
         if self.formatdict is None:
             return ""
         else:
-            fmt = self.formatdict.pop(x, "")
+            fmt = self.formatdict.pop(TimeSeries_DateLocator._mdates_to_ordinal(x, freq=self.freq), "")
             if isinstance(fmt, np.bytes_):
                 fmt = fmt.decode("utf-8")
             with warnings.catch_warnings():
@@ -1077,7 +1092,7 @@ class TimeSeries_DateFormatter(Formatter):
                     "Period with BDay freq is deprecated",
                     category=FutureWarning,
                 )
-                period = Period(ordinal=int(x), freq=self.freq)
+                period = Period(mdates.num2date(x), freq=self.freq)
             assert isinstance(period, Period)
             return period.strftime(fmt)
 
